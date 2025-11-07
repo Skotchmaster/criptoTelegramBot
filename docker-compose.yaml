@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  crypto-bot:
+    build: .
+    image: crypto-bot:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; print('ok')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
