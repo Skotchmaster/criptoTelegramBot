@@ -1,20 +1,25 @@
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from ..services.coins import get_top_100_id_symbol_name
-from ..keyboards import paginate_coins
+
+START_TEXT = (
+    "Привет! Я авто‑сканер. Каждые 15 минут проверяю топ‑100 монет на таймфреймах 1h/4h/1d "
+    "и присылаю алерты, если подряд 8 свечей одного цвета.\n\n"
+    "Также я умею делать ручную сводку по выбранной монете."
+)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    storage = context.application.bot_data.get("storage")
-    if storage:
-        storage.add_chat(update.effective_chat.id)
+    storage = context.application.bot_data["storage"]
+    await storage.add_chat(update.effective_chat.id)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Анализ монеты", callback_data="an|page|1")],
+        [InlineKeyboardButton("ℹ️ Справка", callback_data="help")]
+    ])
+    await update.message.reply_text(START_TEXT, reply_markup=kb)
 
-    async with context.application.bot_data["http"] as session:
-        coins = await get_top_100_id_symbol_name(session)
-    context.user_data["coins"] = coins
-    context.user_data["page"] = 0
-    await update.message.reply_html(
-        "Привет! Я анализирую свечи топ-100 криптовалют.\n"
-        "Алерты работают автоматически для 1h, 4h и 1d — ничего включать не нужно.\n\n"
-        "Выберите монету:",
-        reply_markup=paginate_coins(coins, 0)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "• Автоматические алерты: проверка 1h/4h/1d, 8 последних свечей подряд зелёные/красные.\n"
+        "• /analyze — выбери монету из топ‑100 (доступные на Binance USDT), затем таймфрейм и получи сводку "
+        "RSI(14), SMA20/50, тренд, кроссы и базовые свечные паттерны."
     )
+    await update.effective_message.reply_text(text)
