@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Iterable, List, Sequence
 
 import pandas as pd
@@ -9,12 +10,14 @@ import pandas as pd
 
 class Scanner:
     """
-    Скандер «8 одинаковых свечей подряд» для таймфреймов 1h/4h/1d.
-    Минимально зависит от остального проекта:
-      - ожидает у Binance метод get_klines(symbol, interval, limit=...)
-      - ожидает у storage метод get_chats() -> Iterable[int]
-    Если «умных» методов получения топ-100 нет, будет фолбэк на популярные USDT-пары.
+    Сканер «N одинаковых свечей подряд» для таймфреймов 1h/4h/1d.
+
+    Требования к зависимостям:
+      - binance.get_klines(symbol, interval, limit=...)
+      - storage.get_chats() -> Iterable[int]
     """
+
+    TF_LIMITS = {"1h": 200, "4h": 240, "1d": 500}
 
     def __init__(
         self,
@@ -41,23 +44,27 @@ class Scanner:
         return await self._resolve_pairs()
 
     async def scan_once_and_alert(self, application) -> None:
-        """Один проход сканера: собираем пары, проверяем все ТФ, шлём алерты."""
+        """Один проход сканера: собираем пары, проверяем все ТФ, шлём алерты (только закрытые свечи)."""
         pairs = await self._resolve_pairs()
         if not pairs:
             self.log.warning("Нет доступных торговых пар для сканирования")
             return
 
         jobs: List[tuple[str, str]] = [(pair, tf) for pair in pairs for tf in self.timeframes]
-
         window = 20
+
         for i in range(0, len(jobs), window):
-            chunk = jobs[i : i + window]
+            chunk = jobs[i: i + window]
             await asyncio.gather(*(self._process_pair_tf(application, pair, tf) for pair, tf in chunk))
-            await asyncio.sleep(self.batch_sleep)
+            if self.batch_sleep:
+                await asyncio.sleep(self.batch_sleep)
 
     async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
+        """Обработка одной пары на одном ТФ: проверка «required_streak» закрытых свечей одного цвета."""
+        limit = max(self.klines_limit, self.TF_LIMITS.get(tf, self.klines_limit), self.required_streak + 10)
+
         try:
-            raw = await self.bn.get_klines(symbol, tf, limit=max(self.klines_limit, self.required_streak + 5))
+            raw = await self.bn.get_klines(symbol, tf, limit=limit)
         except Exception as e:
             self.log.debug("get_klines failed for %s %s: %s", symbol, tf, e)
             return
@@ -84,10 +91,17 @@ class Scanner:
             f"Закрытие: <code>{close_t}</code>"
         )
 
-        chats: Iterable[int] = await self.storage.get_chats()
+        try:
+            chats: Iterable[int] = await self.storage.get_chats()
+        except Exception:
+            self.log.exception("get_chats() failed")
+            return
+
         tasks = [
-            application.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True)
-            for chat_id in chats
+            application.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True
+            )
+            for chat_id in set(chats)
         ]
         if tasks:
             try:
@@ -95,9 +109,21 @@ class Scanner:
             except Exception:
                 self.log.exception("send_message failed for %s %s", symbol, tf)
 
-    def klines_to_df(self, klines: List[List[Any]]) -> pd.DataFrame:
-        """Преобразование klines в DataFrame с корректными типами."""
+    @staticmethod
+    def _closed_only(klines: Sequence[Sequence]) -> List[Sequence]:
+        """Отбрасываем текущую незакрытую свечу (k[6] = closeTime в ms, он должен быть <= now)."""
         if not klines:
+            return []
+        now_ms = int(time.time() * 1000)
+        return [k for k in klines if int(k[6]) <= now_ms]
+
+    def klines_to_df(self, klines: List[List[Any]]) -> pd.DataFrame:
+        """
+        Преобразование klines в DataFrame с корректными типами.
+        Используются ТОЛЬКО закрытые свечи.
+        """
+        rows = self._closed_only(klines)
+        if not rows:
             return pd.DataFrame()
 
         cols = [
@@ -105,15 +131,20 @@ class Scanner:
             "close_time", "quote_volume", "trades",
             "taker_buy_base", "taker_buy_quote", "ignore",
         ]
-        df = pd.DataFrame(klines, columns=cols)
+        df = pd.DataFrame(rows, columns=cols)
+
+        # типы
+        num_cols = ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]
+        df[num_cols] = df[num_cols].astype(float, errors="ignore")
+
+        # времена
         df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
         df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-        num_cols = ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]
-        df[num_cols] = df[num_cols].astype(float, errors="ignore")
+
         return df
 
     def _streak_color(self, df: pd.DataFrame, n: int) -> str | None:
-        """Возвращает 'green'/'red' если последние n свечей одного цвета, иначе None."""
+        """Возвращает 'green'/'red' если ПОСЛЕДНИЕ n СЗАКРЫТЫХ свечей одного цвета, иначе None."""
         if len(df) < n:
             return None
         tail = df.tail(n)

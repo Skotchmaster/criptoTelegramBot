@@ -10,12 +10,12 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
 from bot.config import load_config
 from bot.storage import JSONStorage
-    # ваш класс хранилища
 from bot.services.http import HttpClient
-    # общий aiohttp клиент
 from bot.services.coingecko import CoinGecko
 from bot.services.binance import Binance
 from bot.services.scanner import Scanner
@@ -23,8 +23,6 @@ from bot.handlers.start import start, help_cmd
 from bot.handlers.analyze import analyze_cmd, on_callback
 from bot.utils.logging import setup_logging
 
-
-# Единый логгер модуля
 log = logging.getLogger("bot.main")
 
 
@@ -36,8 +34,9 @@ async def on_startup(app: Application):
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
     if admin:
         try:
+            admin_id = int(admin)
             storage: JSONStorage = app.bot_data["storage"]
-            await storage.add_chat(int(admin))
+            await storage.add_chat(admin_id)
             log.info("ADMIN_CHAT_ID=%s подписан на авто-алерты", admin)
         except Exception as e:
             log.warning("ADMIN_CHAT_ID не добавлен: %s", e)
@@ -45,11 +44,31 @@ async def on_startup(app: Application):
 
 async def on_shutdown(app: Application):
     """Хук при остановке приложения."""
-    http: HttpClient = app.bot_data["http"]
+    http: HttpClient = app.bot_data.get("http")
+    if not http:
+        return
     try:
         await http.close()
     except Exception as e:
         log.warning("HTTP session close error: %s", e)
+
+
+def _build_httpx_request() -> HTTPXRequest:
+    """
+    Кастомный клиент для Telegram API:
+    - больше пул соединений (чтобы не ловить pool_timeout/TimedOut),
+    - адекватные таймауты,
+    - поддержка прокси через env.
+    """
+    proxy = os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("ALL_PROXY") or None
+    return HTTPXRequest(
+        connection_pool_size=20,     # дефолт 1 → легко схлопотать очереди
+        pool_timeout=None,           # не падать, если пул занят
+        connect_timeout=30.0,        # дефолт ~5
+        read_timeout=30.0,           # дефолт ~5
+        write_timeout=30.0,          # дефолт ~5
+        proxy=proxy,                 # http://... или socks5://... (для SOCKS нужна extra [socks])
+    )
 
 
 def build_app() -> Application:
@@ -60,7 +79,8 @@ def build_app() -> Application:
     builder = (
         ApplicationBuilder()
         .token(cfg.BOT_TOKEN)
-        .post_init(on_startup)   # навешиваем хуки через builder
+        .request(_build_httpx_request())  # ← ключевая строка против TimedOut
+        .post_init(on_startup)
         .post_stop(on_shutdown)
     )
     app = builder.build()
@@ -87,7 +107,7 @@ def build_app() -> Application:
         }
     )
 
-    # Хендлеры команд/кнопок
+    # Хендлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
@@ -112,9 +132,15 @@ def build_app() -> Application:
         name="scanner",
     )
 
-    # Глобальный обработчик ошибок (без обращения к app.logger)
+    # Глобальный обработчик ошибок: не спамим трейсами при временных сетевых таймаутах
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-        logging.getLogger("bot.app").exception("Unhandled error", exc_info=context.error)
+        err = context.error
+        text = str(err)
+        retryable_markers = ("ConnectTimeout", "ReadTimeout", "Timed out", "ConnectError")
+        if isinstance(err, (TimedOut, NetworkError)) or any(m in text for m in retryable_markers):
+            logging.getLogger("bot.app").warning("Telegram API timeout/network issue: %s", text)
+            return
+        logging.getLogger("bot.app").exception("Unhandled error", exc_info=err)
 
     app.add_error_handler(on_error)
 
@@ -123,7 +149,6 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
-    # drop_pending_updates=True удалит старые очереди от Webhook
     app.run_polling(drop_pending_updates=True)
 
 
