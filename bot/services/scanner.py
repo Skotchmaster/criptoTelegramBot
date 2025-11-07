@@ -1,113 +1,174 @@
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime, timezone
-from typing import List, Tuple, Optional
+import logging
+from typing import Any, Iterable, List, Sequence
+
 import pandas as pd
 
-from bot.utils.timeframes import TIMEFRAMES, normalize_symbol
-from bot.utils.indicators import rsi_ewma, sma
-from bot.utils.patterns import detect_patterns_last
-from bot.utils.text import format_summary, format_alert
-from bot.storage import JSONStorage
 
 class Scanner:
-    def __init__(self, coingecko, binance, storage: JSONStorage, batch_sleep: float = 0.02):
+    """
+    Скандер «8 одинаковых свечей подряд» для таймфреймов 1h/4h/1d.
+    Минимально зависит от остального проекта:
+      - ожидает у Binance метод get_klines(symbol, interval, limit=...)
+      - ожидает у storage метод get_chats() -> Iterable[int]
+    Если «умных» методов получения топ-100 нет, будет фолбэк на популярные USDT-пары.
+    """
+
+    def __init__(
+        self,
+        coingecko: Any,
+        binance: Any,
+        storage: Any,
+        *,
+        batch_sleep: float = 0.02,
+        required_streak: int = 8,
+        timeframes: Sequence[str] = ("1h", "4h", "1d"),
+        klines_limit: int = 120,
+    ) -> None:
         self.cg = coingecko
         self.bn = binance
         self.storage = storage
         self.batch_sleep = batch_sleep
+        self.required_streak = required_streak
+        self.timeframes = list(timeframes)
+        self.klines_limit = klines_limit
+        self.log = logging.getLogger(__name__)
 
-    async def scannable_pairs(self) -> List[Tuple[str, str]]:
-        top = await self.cg.top100()
-        usdt = await self.bn.available_usdt_symbols()
-        pairs: List[Tuple[str, str]] = []
-        for c in top:
-            sym = normalize_symbol(c.get("symbol", ""))
-            pair = f"{sym}USDT"
-            if pair in usdt:
-                pairs.append((pair, c.get("name", sym)))
-        return pairs
+    async def scannable_pairs(self) -> List[str]:
+        """Список доступных торговых пар (до 100 шт.). Используется в /analyze."""
+        return await self._resolve_pairs()
 
-    @staticmethod
-    def klines_to_df(klines) -> Optional[pd.DataFrame]:
-        if not klines or len(klines) < 9:
-            return None
-        cols = ["open_time","open","high","low","close","volume","close_time","qav","trades","taker_base","taker_quote","ignore"]
-        df = pd.DataFrame(klines, columns=cols)
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
-        import pandas as pd
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-        now = pd.Timestamp(datetime.now(timezone.utc))
-        df = df[df["close_time"] <= now]
-        return df
+    async def scan_once_and_alert(self, application) -> None:
+        """Один проход сканера: собираем пары, проверяем все ТФ, шлём алерты."""
+        pairs = await self._resolve_pairs()
+        if not pairs:
+            self.log.warning("Нет доступных торговых пар для сканирования")
+            return
 
-    @staticmethod
-    def eight_in_a_row(df: pd.DataFrame) -> Optional[str]:
-        last8 = df.tail(8)
-        up = (last8["close"] > last8["open"]).all()
-        down = (last8["close"] < last8["open"]).all()
-        if up:
-            return "green"
-        if down:
-            return "red"
-        return None
+        jobs: List[tuple[str, str]] = [(pair, tf) for pair in pairs for tf in self.timeframes]
 
-    async def scan_once_and_alert(self, application, timeframes: List[str] = None):
-        if timeframes is None:
-            timeframes = list(TIMEFRAMES.keys())
-        pairs = await self.scannable_pairs()
-        chats = await self.storage.list_chats()
-
-        tasks = []
-        for pair, _ in pairs:
-            for tf in timeframes:
-                tasks.append((pair, tf))
-
-        CHUNK = 20
-        for i in range(0, len(tasks), CHUNK):
-            chunk = tasks[i:i+CHUNK]
+        window = 20
+        for i in range(0, len(jobs), window):
+            chunk = jobs[i : i + window]
             await asyncio.gather(*(self._process_pair_tf(application, pair, tf) for pair, tf in chunk))
             await asyncio.sleep(self.batch_sleep)
 
-    async def _process_pair_tf(self, application, pair: str, tf: str):
-        raw = await self.bn.get_klines(pair, TIMEFRAMES[tf], limit=10)
-        if not raw:
+    async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
+        try:
+            raw = await self.bn.get_klines(symbol, tf, limit=max(self.klines_limit, self.required_streak + 5))
+        except Exception as e:
+            self.log.debug("get_klines failed for %s %s: %s", symbol, tf, e)
             return
+
         df = self.klines_to_df(raw)
-        if df is None:
+        if df.empty or len(df) < self.required_streak:
             return
-        direction = self.eight_in_a_row(df)
-        if direction:
-            last_close_iso = df.iloc[-1]["close_time"].isoformat()
-            key = f"{tf}|{pair}|{last_close_iso}"
-            if await self.storage.has_alert(key):
-                return
-            msg = format_alert(pair, tf, direction, df.iloc[-1]["close_time"])
-            for chat_id in await self.storage.list_chats():
+
+        color = self._streak_color(df, self.required_streak)
+        if color is None:
+            return
+
+        last = df.iloc[-1]
+        direction_ru = "зелёные" if color == "green" else "красные"
+        price = f"{last['close']:.6g}"
+        open_t = last["open_time"].strftime("%Y-%m-%d %H:%M UTC")
+        close_t = last["close_time"].strftime("%Y-%m-%d %H:%M UTC")
+
+        text = (
+            f"⚡️ <b>{symbol}</b> • <code>{tf}</code>\n"
+            f"Последние <b>{self.required_streak}</b> свечей — все <b>{direction_ru}</b>.\n"
+            f"Цена закрытия: <code>{price}</code>\n"
+            f"Открытие: <code>{open_t}</code>\n"
+            f"Закрытие: <code>{close_t}</code>"
+        )
+
+        chats: Iterable[int] = await self.storage.get_chats()
+        tasks = [
+            application.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True)
+            for chat_id in chats
+        ]
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                self.log.exception("send_message failed for %s %s", symbol, tf)
+
+    def klines_to_df(self, klines: List[List[Any]]) -> pd.DataFrame:
+        """Преобразование klines в DataFrame с корректными типами."""
+        if not klines:
+            return pd.DataFrame()
+
+        cols = [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore",
+        ]
+        df = pd.DataFrame(klines, columns=cols)
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+        num_cols = ["open","high","low","close","volume","quote_volume","taker_buy_base","taker_buy_quote"]
+        df[num_cols] = df[num_cols].astype(float, errors="ignore")
+        return df
+
+    def _streak_color(self, df: pd.DataFrame, n: int) -> str | None:
+        """Возвращает 'green'/'red' если последние n свечей одного цвета, иначе None."""
+        if len(df) < n:
+            return None
+        tail = df.tail(n)
+        up = (tail["close"] > tail["open"]).all()
+        down = (tail["close"] < tail["open"]).all()
+        if up and not down:
+            return "green"
+        if down and not up:
+            return "red"
+        return None
+
+    async def _resolve_pairs(self) -> List[str]:
+        """Пытается получить топ USDT-пар из Binance/CoinGecko, иначе фолбэк."""
+        for meth in ("get_top_usdt_pairs", "list_top_usdt_pairs", "top_pairs"):
+            if hasattr(self.bn, meth):
                 try:
-                    await application.bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True, parse_mode="HTML")
-                except Exception:
-                    pass
-            await self.storage.mark_alert(key)
+                    pairs = await getattr(self.bn, meth)(limit=100)
+                    pairs = [p for p in pairs if isinstance(p, str)]
+                    if pairs:
+                        return pairs[:100]
+                except Exception as e:
+                    self.log.debug("%s() failed: %s", meth, e)
 
-    async def manual_summary(self, pair: str, tf: str) -> Optional[str]:
-        raw = await self.bn.get_klines(pair, TIMEFRAMES[tf], limit=100)
-        if not raw:
-            return None
-        df = self.klines_to_df(raw)
-        if df is None or len(df) < 50:
-            return None
+        for meth in ("get_exchange_info", "exchange_info"):
+            if hasattr(self.bn, meth):
+                try:
+                    info = await getattr(self.bn, meth)()
+                    symbols = info.get("symbols") or []
+                    pairs = [
+                        s["symbol"]
+                        for s in symbols
+                        if s.get("status") == "TRADING"
+                        and s.get("quoteAsset") == "USDT"
+                        and s.get("isSpotTradingAllowed", True)
+                    ]
+                    if pairs:
+                        return pairs[:100]
+                except Exception as e:
+                    self.log.debug("%s() failed: %s", meth, e)
 
-        df["sma20"] = sma(df["close"], 20)
-        df["sma50"] = sma(df["close"], 50)
-        df["rsi14"] = rsi_ewma(df["close"], 14)
+        for meth in ("top_coins", "get_top_coins", "markets_top"):
+            if hasattr(self.cg, meth):
+                try:
+                    items = await getattr(self.cg, meth)(limit=120)
+                    syms = []
+                    for it in items or []:
+                        sym = (it.get("symbol") or it.get("ticker") or "").upper()
+                        if sym and sym.isalpha() and 3 <= len(sym) <= 6:
+                            syms.append(sym + "USDT")
+                    if syms:
+                        return syms[:100]
+                except Exception as e:
+                    self.log.debug("coingecko.%s() failed: %s", meth, e)
 
-        trend = "bull" if df["sma20"].iloc[-1] > df["sma50"].iloc[-1] else "bear"
-        prev_rel = df["sma20"].iloc[-2] - df["sma50"].iloc[-2]
-        curr_rel = df["sma20"].iloc[-1] - df["sma50"].iloc[-1]
-        cross = "golden" if prev_rel <= 0 and curr_rel > 0 else ("death" if prev_rel >= 0 and curr_rel < 0 else "none")
-
-        patterns = detect_patterns_last(df)
-
-        return format_summary(pair, tf, df.iloc[-1], df["rsi14"].iloc[-1], df["sma20"].iloc[-1], df["sma50"].iloc[-1], trend, cross, patterns)
+        return [
+            "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","TONUSDT","TRXUSDT","DOTUSDT",
+            "MATICUSDT","AVAXUSDT","LINKUSDT","APTUSDT","NEARUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","FILUSDT","AAVEUSDT",
+        ]

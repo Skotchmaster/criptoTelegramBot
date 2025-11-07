@@ -1,45 +1,68 @@
-import asyncio
+from __future__ import annotations
+
 import json
+import asyncio
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
+
 
 class JSONStorage:
+    """
+    Простое файловое хранилище в JSON.
+    Структура файла: {"chats": [<chat_id:int>, ...]}
+    """
+
     def __init__(self, path: Path):
         self.path = path
-        self.lock = asyncio.Lock()
+        self._lock = asyncio.Lock()
+
+
+    async def _ensure_file(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
-            self._write_sync({"chats": [], "alerts_sent": {}})
+            await self._write({"chats": []})
 
-    def _read_sync(self) -> Dict:
-        if not self.path.exists():
-            return {"chats": [], "alerts_sent": {}}
-        with open(self.path, "r", encoding="utf-8") as f:
-            return json.load(f)
+    async def _read(self) -> Dict[str, Any]:
+        await self._ensure_file()
 
-    def _write_sync(self, data: Dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(self.path)
+        def _sync_read():
+            with self.path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+
+        return await asyncio.to_thread(_sync_read)
+
+    async def _write(self, data: Dict[str, Any]) -> None:
+
+        def _sync_write():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+
+        await asyncio.to_thread(_sync_write)
+
+
+    async def get_chats(self) -> List[int]:
+        """Вернуть уникальные chat_id, отсортированные по возрастанию."""
+        async with self._lock:
+            data = await self._read()
+            chats = data.get("chats") or []
+            return sorted({int(c) for c in chats})
 
     async def add_chat(self, chat_id: int) -> None:
-        async with self.lock:
-            data = self._read_sync()
-            if chat_id not in data["chats"]:
-                data["chats"].append(chat_id)
-                self._write_sync(data)
+        """Добавить чат в подписчики (идемпотентно)."""
+        async with self._lock:
+            data = await self._read()
+            chats = set(int(c) for c in data.get("chats") or [])
+            chats.add(int(chat_id))
+            data["chats"] = sorted(chats)
+            await self._write(data)
 
-    async def list_chats(self) -> List[int]:
-        async with self.lock:
-            return list(self._read_sync().get("chats", []))
-
-    async def has_alert(self, key: str) -> bool:
-        async with self.lock:
-            return key in self._read_sync().get("alerts_sent", {})
-
-    async def mark_alert(self, key: str) -> None:
-        async with self.lock:
-            data = self._read_sync()
-            data.setdefault("alerts_sent", {})[key] = True
-            self._write_sync(data)
+    async def remove_chat(self, chat_id: int) -> None:
+        """Удалить чат из подписчиков (если был)."""
+        async with self._lock:
+            data = await self._read()
+            chats = set(int(c) for c in data.get("chats") or [])
+            chats.discard(int(chat_id))
+            data["chats"] = sorted(chats)
+            await self._write(data)
