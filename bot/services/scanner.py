@@ -6,6 +6,9 @@ import time
 from typing import Any, Iterable, List, Sequence
 
 import pandas as pd
+from telegram.error import Forbidden, BadRequest  # PTB exceptions
+
+log = logging.getLogger("bot.scanner")
 
 
 class Scanner:
@@ -15,6 +18,8 @@ class Scanner:
     Требования к зависимостям:
       - binance.get_klines(symbol, interval, limit=...)
       - storage.get_chats() -> Iterable[int]
+      - storage.is_alert_sent(chat_id, key)
+      - storage.mark_alert_sent(chat_id, key, ttl_days: int | None = None)
     """
 
     TF_LIMITS = {"1h": 200, "4h": 240, "1d": 500}
@@ -37,7 +42,6 @@ class Scanner:
         self.required_streak = required_streak
         self.timeframes = list(timeframes)
         self.klines_limit = klines_limit
-        self.log = logging.getLogger(__name__)
 
     async def scannable_pairs(self) -> List[str]:
         """Список доступных торговых пар (до 100 шт.). Используется в /analyze."""
@@ -47,26 +51,26 @@ class Scanner:
         """Один проход сканера: собираем пары, проверяем все ТФ, шлём алерты (только закрытые свечи)."""
         pairs = await self._resolve_pairs()
         if not pairs:
-            self.log.warning("Нет доступных торговых пар для сканирования")
+            log.warning("Нет доступных торговых пар для сканирования")
             return
 
         jobs: List[tuple[str, str]] = [(pair, tf) for pair in pairs for tf in self.timeframes]
         window = 20
 
         for i in range(0, len(jobs), window):
-            chunk = jobs[i: i + window]
+            chunk = jobs[i : i + window]
             await asyncio.gather(*(self._process_pair_tf(application, pair, tf) for pair, tf in chunk))
             if self.batch_sleep:
                 await asyncio.sleep(self.batch_sleep)
 
     async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
-        """Обработка одной пары на одном таймфрейме: тянем klines, проверяем серию и шлём алерт (без дублей)."""
+        """Обработка одной пары на одном таймфрейме: тянем klines, проверяем серию и шлём алерт (per-chat дедуп)."""
         try:
             # берём побольше, чтобы точно хватило на фильтры/хвост
             limit = max(200, self.required_streak + 50)
-            klines = await self.bn.get_klines(symbol, tf, limit=limit)  # <-- self.bn
+            klines = await self.bn.get_klines(symbol, tf, limit=limit)
         except Exception:
-            self.log.exception("binance.get_klines(%s, %s) failed", symbol, tf)
+            log.exception("binance.get_klines(%s, %s) failed", symbol, tf)
             return
 
         if not klines:
@@ -79,9 +83,9 @@ class Scanner:
 
         # Превращаем в DataFrame нашей формы
         try:
-            df = self.klines_to_df(closed)  # <-- klines_to_df
+            df = self.klines_to_df(closed)
         except Exception:
-            self.log.exception("to_df failed for %s %s", symbol, tf)
+            log.exception("to_df failed for %s %s", symbol, tf)
             return
 
         if df.empty or len(df) < self.required_streak:
@@ -91,7 +95,7 @@ class Scanner:
         if color is None:
             return
 
-        # Дедупликация: не дублируем алерты для одной и той же закрытой свечи
+        # Дедуп-ключ для конкретной закрытой свечи
         last_row = df.iloc[-1]
         try:
             close_ts = int(last_row["close_time"].timestamp())
@@ -100,13 +104,17 @@ class Scanner:
             close_ts = int(pd.to_datetime(last_row["close_time"]).timestamp())
 
         dedup_key = f"{symbol}:{tf}:streak{self.required_streak}:{'green' if color=='green' else 'red'}:close{close_ts}"
-        try:
-            if await self.storage.is_alert_sent(dedup_key):
-                return  # уже слали по этой закрытой свече — выходим
-        except Exception:
-            self.log.exception("storage.is_alert_sent failed")
+        log.info(
+            "ALERT detected: %s %s streak=%d color=%s close_ts=%s",
+            symbol,
+            tf,
+            self.required_streak,
+            color,
+            close_ts,
+        )
+        log.info("Dedup key -> %s", dedup_key)
 
-        # Формируем текст и рассылаем
+        # Формируем текст
         last = last_row
         direction_ru = "зелёные" if color == "green" else "красные"
         price = f"{last['close']:.6g}"
@@ -121,28 +129,67 @@ class Scanner:
             f"Закрытие: <code>{close_t}</code>"
         )
 
+        # Рассылка всем подписчикам с per-chat дедупом
         try:
             chats: Iterable[int] = await self.storage.get_chats()
         except Exception:
-            self.log.exception("get_chats() failed")
+            log.exception("get_chats() failed")
             return
 
-        tasks = [
-            application.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True
-            )
-            for chat_id in set(chats)
-        ]
-        if tasks:
+        chats = list(set(chats))
+        log.info("Broadcasting alert to %d chats", len(chats))
+
+        sent_any = False
+        for chat_id in chats:
             try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                # помечаем как отправленное только после успешной рассылки
+                # per-chat проверка дубля
                 try:
-                    await self.storage.mark_alert_sent(dedup_key)
+                    if await self.storage.is_alert_sent(chat_id, dedup_key):
+                        log.info("Skip alert for chat=%s (already sent): %s", chat_id, dedup_key)
+                        continue
                 except Exception:
-                    self.log.exception("storage.mark_alert_sent failed")
-            except Exception:
-                self.log.exception("send_message failed for %s %s", symbol, tf)
+                    log.exception("storage.is_alert_sent(chat) failed")
+                    # не роняем рассылку, пробуем отправить
+
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                    disable_web_page_preview=True,
+                )
+                log.debug("Sent to chat=%s", chat_id)
+                sent_any = True
+
+                # помечаем per-chat только после успешной доставки
+                try:
+                    await self.storage.mark_alert_sent(chat_id, dedup_key)
+                except Exception:
+                    log.exception("storage.mark_alert_sent(chat) failed")
+
+            except Forbidden:
+                # пользователь заблокировал бота или никогда не нажимал Start
+                log.warning("Forbidden chat=%s (blocked or never /start). Removing.", chat_id)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except BadRequest as e:
+                # неверный chat_id / бот не в группе / нет прав в канале
+                log.warning("BadRequest chat=%s: %s. Removing.", chat_id, e)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except Exception as e:
+                # логируем и продолжаем, чтобы не сломать рассылку остальным
+                log.exception("Send failed chat=%s: %s (skip, continue)", chat_id, e)
+
+        # Глобальных меток больше нет — отмечаем только per-chat.
+        if not sent_any:
+            log.warning("Alert NOT marked sent (no successful deliveries): %s", dedup_key)
+
+    # ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 
     @staticmethod
     def _closed_only(klines: Sequence[Sequence]) -> List[Sequence]:
@@ -162,9 +209,18 @@ class Scanner:
             return pd.DataFrame()
 
         cols = [
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades",
-            "taker_buy_base", "taker_buy_quote", "ignore",
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
+            "trades",
+            "taker_buy_base",
+            "taker_buy_quote",
+            "ignore",
         ]
         df = pd.DataFrame(rows, columns=cols)
 
@@ -179,7 +235,7 @@ class Scanner:
         return df
 
     def _streak_color(self, df: pd.DataFrame, n: int) -> str | None:
-        """Возвращает 'green'/'red' если ПОСЛЕДНИЕ n СЗАКРЫТЫХ свечей одного цвета, иначе None."""
+        """Возвращает 'green'/'red' если ПОСЛЕДНИЕ n закрытых свечей одного цвета, иначе None."""
         if len(df) < n:
             return None
         tail = df.tail(n)
@@ -201,7 +257,7 @@ class Scanner:
                     if pairs:
                         return pairs[:100]
                 except Exception as e:
-                    self.log.debug("%s() failed: %s", meth, e)
+                    log.debug("%s() failed: %s", meth, e)
 
         for meth in ("get_exchange_info", "exchange_info"):
             if hasattr(self.bn, meth):
@@ -218,7 +274,7 @@ class Scanner:
                     if pairs:
                         return pairs[:100]
                 except Exception as e:
-                    self.log.debug("%s() failed: %s", meth, e)
+                    log.debug("%s() failed: %s", meth, e)
 
         for meth in ("top_coins", "get_top_coins", "markets_top"):
             if hasattr(self.cg, meth):
@@ -232,9 +288,27 @@ class Scanner:
                     if syms:
                         return syms[:100]
                 except Exception as e:
-                    self.log.debug("coingecko.%s() failed: %s", meth, e)
+                    log.debug("coingecko.%s() failed: %s", meth, e)
 
         return [
-            "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","TONUSDT","TRXUSDT","DOTUSDT",
-            "MATICUSDT","AVAXUSDT","LINKUSDT","APTUSDT","NEARUSDT","ATOMUSDT","LTCUSDT","UNIUSDT","FILUSDT","AAVEUSDT",
+            "BTCUSDT",
+            "ETHUSDT",
+            "BNBUSDT",
+            "SOLUSDT",
+            "XRPUSDT",
+            "ADAUSDT",
+            "DOGEUSDT",
+            "TONUSDT",
+            "TRXUSDT",
+            "DOTUSDT",
+            "MATICUSDT",
+            "AVAXUSDT",
+            "LINKUSDT",
+            "APTUSDT",
+            "NEARUSDT",
+            "ATOMUSDT",
+            "LTCUSDT",
+            "UNIUSDT",
+            "FILUSDT",
+            "AAVEUSDT",
         ]

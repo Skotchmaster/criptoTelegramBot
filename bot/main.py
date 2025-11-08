@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import os
 import logging
 
@@ -7,7 +7,6 @@ from telegram.ext import (
     ApplicationBuilder,
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
@@ -26,17 +25,28 @@ log = logging.getLogger("bot.main")
 
 
 async def on_startup(app: Application):
-    """Хук после инициализации Application, но до начала приема апдейтов."""
+    """
+    Хук после инициализации Application, но до начала приёма апдейтов.
+    Тут стартуем общий HTTP-клиент и при необходимости автоподписываем админа.
+    Плюс — полезные логи по окружению и подписчикам.
+    """
     http: HttpClient = app.bot_data["http"]
     await http.start()
+
+    storage: JSONStorage = app.bot_data["storage"]
+
+    tz = os.getenv("TZ", "UTC")
+    log.info("Startup at %s TZ=%s", datetime.now(timezone.utc).isoformat(), tz)
+
+    chats = await storage.get_chats()
+    log.info("Subscribers on start: %d -> %s", len(chats), chats)
 
     admin = os.getenv("ADMIN_CHAT_ID", "").strip()
     if admin:
         try:
             admin_id = int(admin)
-            storage: JSONStorage = app.bot_data["storage"]
             await storage.add_chat(admin_id)
-            log.info("ADMIN_CHAT_ID=%s подписан на авто-алерты", admin)
+            log.info("ADMIN_CHAT_ID=%s автоподписан на авто-алерты", admin)
         except Exception as e:
             log.warning("ADMIN_CHAT_ID не добавлен: %s", e)
 
@@ -48,6 +58,7 @@ async def on_shutdown(app: Application):
         return
     try:
         await http.close()
+        log.info("HTTP session closed")
     except Exception as e:
         log.warning("HTTP session close error: %s", e)
 
@@ -55,36 +66,37 @@ async def on_shutdown(app: Application):
 def _build_httpx_request() -> HTTPXRequest:
     """
     Кастомный клиент для Telegram API:
-    - больше пул соединений (чтобы не ловить pool_timeout/TimedOut),
+    - больше пул соединений,
     - адекватные таймауты,
     - поддержка прокси через env.
     """
     proxy = os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("ALL_PROXY") or None
     return HTTPXRequest(
-        connection_pool_size=20,     # дефолт 1 → легко схлопотать очереди
-        pool_timeout=None,           # не падать, если пул занят
-        connect_timeout=30.0,        # дефолт ~5
-        read_timeout=30.0,           # дефолт ~5
-        write_timeout=30.0,          # дефолт ~5
-        proxy=proxy,                 # http://... или socks5://... (для SOCKS нужна extra [socks])
+        connection_pool_size=20,
+        pool_timeout=None,
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        proxy=proxy,
     )
 
 
 def build_app() -> Application:
     setup_logging()
+
     cfg = load_config()
-    log.info("Config loaded. TZ=%s, SCAN_INTERVAL_MIN=%s", os.getenv("TZ"), cfg.SCAN_INTERVAL_MIN)
+    log.info("Config loaded. TZ=%s, SCAN_INTERVAL_MIN=%s, HTTP_TIMEOUT=%s",
+             os.getenv("TZ", "UTC"), cfg.SCAN_INTERVAL_MIN, cfg.HTTP_TIMEOUT)
 
     builder = (
         ApplicationBuilder()
         .token(cfg.BOT_TOKEN)
-        .request(_build_httpx_request())  # ← ключевая строка против TimedOut
+        .request(_build_httpx_request())
         .post_init(on_startup)
         .post_stop(on_shutdown)
     )
     app = builder.build()
 
-    # Сервисы/хранилище
     storage = JSONStorage(Path("data/state.json"))
     http = HttpClient(timeout=cfg.HTTP_TIMEOUT)
     cg = CoinGecko(http, cache_ttl=cfg.CACHE_TTL_COINGECKO)
@@ -109,8 +121,10 @@ def build_app() -> Application:
     # Хендлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+
     # Планировщик
     if app.job_queue is None:
+        log.error("No JobQueue set up! Установите: pip install 'python-telegram-bot[job-queue]'")
         raise RuntimeError(
             "JobQueue не доступен. Установите: python -m pip install 'python-telegram-bot[job-queue]'"
         )
@@ -127,8 +141,8 @@ def build_app() -> Application:
         first=10,
         name="scanner",
     )
+    log.info('JobQueue: добавлена задача "scanner" каждые %s минут (first=10s)', cfg.SCAN_INTERVAL_MIN)
 
-    # Глобальный обработчик ошибок: не спамим трейсами при временных сетевых таймаутах
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         err = context.error
         text = str(err)
@@ -145,6 +159,7 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
+    log.info("Running polling (drop_pending_updates=True)")
     app.run_polling(drop_pending_updates=True)
 
 
