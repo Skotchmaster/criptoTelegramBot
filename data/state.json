@@ -1,6 +1,12 @@
 {
   "chats": [
-    1046156013
+    1046156013,
+    5889104290,
+    6799348836
   ],
-  "alerts_sent": {}
+  "alerts_sent": {},
+  "alerts": {
+    "ZECUSDT:1d:streak8:green:close1762559999": 1762570825,
+    "ZECUSDT:1h:streak8:red:close1762581599": 1762581625
+  }
 }

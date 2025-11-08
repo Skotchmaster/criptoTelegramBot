@@ -101,7 +101,7 @@ class Scanner:
 
         dedup_key = f"{symbol}:{tf}:streak{self.required_streak}:{'green' if color=='green' else 'red'}:close{close_ts}"
         try:
-            if self.storage.is_alert_sent(dedup_key):
+            if await self.storage.is_alert_sent(dedup_key):
                 return  # уже слали по этой закрытой свече — выходим
         except Exception:
             self.log.exception("storage.is_alert_sent failed")
@@ -138,7 +138,7 @@ class Scanner:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 # помечаем как отправленное только после успешной рассылки
                 try:
-                    self.storage.mark_alert_sent(dedup_key)
+                    await self.storage.mark_alert_sent(dedup_key)
                 except Exception:
                     self.log.exception("storage.mark_alert_sent failed")
             except Exception:

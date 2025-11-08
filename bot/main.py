@@ -14,7 +14,7 @@ from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
 
 from bot.config import load_config
-from bot.storage import JSONStorage
+from bot.services.storage import JSONStorage
 from bot.services.http import HttpClient
 from bot.services.coingecko import CoinGecko
 from bot.services.binance import Binance
