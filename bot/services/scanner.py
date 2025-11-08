@@ -60,16 +60,30 @@ class Scanner:
                 await asyncio.sleep(self.batch_sleep)
 
     async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
-        """Обработка одной пары на одном ТФ: проверка «required_streak» закрытых свечей одного цвета."""
-        limit = max(self.klines_limit, self.TF_LIMITS.get(tf, self.klines_limit), self.required_streak + 10)
-
+        """Обработка одной пары на одном таймфрейме: тянем klines, проверяем серию и шлём алерт (без дублей)."""
         try:
-            raw = await self.bn.get_klines(symbol, tf, limit=limit)
-        except Exception as e:
-            self.log.debug("get_klines failed for %s %s: %s", symbol, tf, e)
+            # берём побольше, чтобы точно хватило на фильтры/хвост
+            limit = max(200, self.required_streak + 50)
+            klines = await self.bn.get_klines(symbol, tf, limit=limit)  # <-- self.bn
+        except Exception:
+            self.log.exception("binance.get_klines(%s, %s) failed", symbol, tf)
             return
 
-        df = self.klines_to_df(raw)
+        if not klines:
+            return
+
+        # Берём только ЗАКРЫТЫЕ свечи, текущую (незакрытую) отбрасываем
+        closed = self._closed_only(klines)
+        if not closed:
+            return
+
+        # Превращаем в DataFrame нашей формы
+        try:
+            df = self.klines_to_df(closed)  # <-- klines_to_df
+        except Exception:
+            self.log.exception("to_df failed for %s %s", symbol, tf)
+            return
+
         if df.empty or len(df) < self.required_streak:
             return
 
@@ -77,7 +91,23 @@ class Scanner:
         if color is None:
             return
 
-        last = df.iloc[-1]
+        # Дедупликация: не дублируем алерты для одной и той же закрытой свечи
+        last_row = df.iloc[-1]
+        try:
+            close_ts = int(last_row["close_time"].timestamp())
+        except Exception:
+            # на случай, если это pandas.Timestamp/str
+            close_ts = int(pd.to_datetime(last_row["close_time"]).timestamp())
+
+        dedup_key = f"{symbol}:{tf}:streak{self.required_streak}:{'green' if color=='green' else 'red'}:close{close_ts}"
+        try:
+            if self.storage.is_alert_sent(dedup_key):
+                return  # уже слали по этой закрытой свече — выходим
+        except Exception:
+            self.log.exception("storage.is_alert_sent failed")
+
+        # Формируем текст и рассылаем
+        last = last_row
         direction_ru = "зелёные" if color == "green" else "красные"
         price = f"{last['close']:.6g}"
         open_t = last["open_time"].strftime("%Y-%m-%d %H:%M UTC")
@@ -106,6 +136,11 @@ class Scanner:
         if tasks:
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
+                # помечаем как отправленное только после успешной рассылки
+                try:
+                    self.storage.mark_alert_sent(dedup_key)
+                except Exception:
+                    self.log.exception("storage.mark_alert_sent failed")
             except Exception:
                 self.log.exception("send_message failed for %s %s", symbol, tf)
 
