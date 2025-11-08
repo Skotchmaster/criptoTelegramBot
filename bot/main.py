@@ -20,7 +20,6 @@ from bot.services.coingecko import CoinGecko
 from bot.services.binance import Binance
 from bot.services.scanner import Scanner
 from bot.handlers.start import start, help_cmd
-from bot.handlers.analyze import analyze_cmd, on_callback
 from bot.utils.logging import setup_logging
 
 log = logging.getLogger("bot.main")
@@ -110,9 +109,6 @@ def build_app() -> Application:
     # Хендлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("analyze", analyze_cmd))
-    app.add_handler(CallbackQueryHandler(on_callback))
-
     # Планировщик
     if app.job_queue is None:
         raise RuntimeError(

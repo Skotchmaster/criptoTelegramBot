@@ -1,5 +1,5 @@
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
 
