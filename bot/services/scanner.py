@@ -240,7 +240,7 @@ class Scanner:
         chats: List[int],
     ) -> None:
         checks = (
-            ("overbought", lambda v: v >= 75, ">= 75"),
+            ("overbought", lambda v: v >= 50, ">= 75"),
             ("oversold", lambda v: v <= 25, "<= 25"),
         )
 
