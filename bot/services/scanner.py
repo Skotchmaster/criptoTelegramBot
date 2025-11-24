@@ -8,6 +8,7 @@ from typing import Any, Iterable, List, Sequence
 import pandas as pd
 from telegram.error import Forbidden, BadRequest  # PTB exceptions
 
+from bot.services.analysis import analyze
 from bot.utils.indicators import rsi_ewma
 from bot.services.patterns.dragon import DragonDetector, DragonPattern, DragonPoint
 
@@ -239,7 +240,7 @@ class Scanner:
         chats: List[int],
     ) -> None:
         checks = (
-            ("overbought", lambda v: v >= 99, ">= 75"),
+            ("overbought", lambda v: v >= 75, ">= 75"),
             ("oversold", lambda v: v <= 25, "<= 25"),
         )
 
@@ -364,18 +365,33 @@ class Scanner:
                 if df.empty or len(df) < 30:
                     continue
 
+                try:
+                    analysis = analyze(df)
+                    rsi_val = float(analysis.get("rsi14", 50))
+                    rsi_state = analysis.get("rsi_state", "neutral")
+                except Exception:
+                    log.exception("analyze() failed for %s %s (Dragon)", symbol, tf)
+                    continue
+
+                last_close_time = df["close_time"].iloc[-1]
                 patterns = self.dragon_detector.detect_all(symbol, tf, df)
                 if not patterns:
                     continue
 
                 for pattern in patterns:
-                    await self._broadcast_dragon_alert(application, pattern, chats)
+                    if not self._is_dragon_confirmed_on_last(pattern, last_close_time):
+                        continue
+                    if not self._dragon_rsi_passed(pattern.direction, rsi_val, rsi_state):
+                        continue
+                    await self._broadcast_dragon_alert(application, pattern, chats, rsi_val, rsi_state)
 
     async def _broadcast_dragon_alert(
         self,
         application,
         pattern: DragonPattern,
         chats: List[int],
+        rsi_val: float,
+        rsi_state: str,
     ) -> None:
         direction_short = "bull" if pattern.direction == "bullish" else "bear"
         try:
@@ -410,7 +426,8 @@ class Scanner:
             f"Hump: {fmt_point(pattern.hump)}\n"
             f"Right paw: {fmt_point(pattern.right_paw)}\n"
             f"{tail_comment}\n"
-            f"Комментарий: {'W' if pattern.direction == 'bullish' else 'M'}-образный разворот"
+            f"RSI(14)={rsi_val:.2f} ({rsi_state}) — условия подтверждения выполнены\n"
+            f"Комментарий: {'W' if pattern.direction == 'bullish' else 'M'}-образный разворот, сигнал сформирован"
         )
 
         sent_any = False
@@ -546,6 +563,19 @@ class Scanner:
         if down and not up:
             return "red"
         return None
+
+    def _is_dragon_confirmed_on_last(self, pattern: DragonPattern, last_close_time: pd.Timestamp) -> bool:
+        try:
+            return pd.to_datetime(pattern.confirm_candle_time) == pd.to_datetime(last_close_time)
+        except Exception:
+            return False
+
+    def _dragon_rsi_passed(self, direction: str, rsi_val: float, rsi_state: str) -> bool:
+        if direction == "bullish":
+            return rsi_val <= 30 or rsi_state == "oversold"
+        if direction == "bearish":
+            return rsi_val >= 70 or rsi_state == "overbought"
+        return False
 
     async def _resolve_pairs(self) -> List[str]:
         """Пытается получить топ USDT-пар из Binance/CoinGecko, иначе фолбэк."""
