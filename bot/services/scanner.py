@@ -229,6 +229,8 @@ class Scanner:
             if len(rsi_values) < 2:
                 continue
 
+            log.info("RSI scan values %s -> %s", symbol, {tf: round(v, 2) for tf, v in rsi_values.items()})
+
             await self._maybe_send_rsi_alerts(application, symbol, rsi_values, close_ts_by_tf, chats)
 
     async def _maybe_send_rsi_alerts(
@@ -240,7 +242,7 @@ class Scanner:
         chats: List[int],
     ) -> None:
         checks = (
-            ("overbought", lambda v: v >= 50, ">= 75"),
+            ("overbought", lambda v: v >= 75, ">= 75"),
             ("oversold", lambda v: v <= 25, "<= 25"),
         )
 
@@ -375,6 +377,15 @@ class Scanner:
 
                 last_close_time = df["close_time"].iloc[-1]
                 patterns = self.dragon_detector.detect_all(symbol, tf, df)
+                log.info(
+                    "Dragon scan %s %s: patterns_found=%d rsi=%.2f state=%s last_close=%s",
+                    symbol,
+                    tf,
+                    len(patterns),
+                    rsi_val,
+                    rsi_state,
+                    last_close_time,
+                )
                 if not patterns:
                     continue
 
