@@ -8,6 +8,8 @@ from typing import Any, Iterable, List, Sequence
 import pandas as pd
 from telegram.error import Forbidden, BadRequest  # PTB exceptions
 
+from bot.utils.indicators import rsi_ewma
+
 log = logging.getLogger("bot.scanner")
 
 
@@ -23,6 +25,7 @@ class Scanner:
     """
 
     TF_LIMITS = {"1h": 200, "4h": 240, "1d": 500}
+    RSI_TIMEFRAMES = ("1h", "4h", "1d")
 
     def __init__(
         self,
@@ -62,6 +65,8 @@ class Scanner:
             await asyncio.gather(*(self._process_pair_tf(application, pair, tf) for pair, tf in chunk))
             if self.batch_sleep:
                 await asyncio.sleep(self.batch_sleep)
+
+        await self.scan_rsi_multi_tf_and_alert(application, pairs=pairs)
 
     async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
         """Обработка одной пары на одном таймфрейме: тянем klines, проверяем серию и шлём алерт (per-chat дедуп)."""
@@ -188,6 +193,166 @@ class Scanner:
         # Глобальных меток больше нет — отмечаем только per-chat.
         if not sent_any:
             log.warning("Alert NOT marked sent (no successful deliveries): %s", dedup_key)
+
+    async def scan_rsi_multi_tf_and_alert(self, application, pairs: Sequence[str] | None = None) -> None:
+        pairs = list(pairs) if pairs is not None else await self._resolve_pairs()
+        if not pairs:
+            log.warning("RSI scan: no pairs to process")
+            return
+
+        try:
+            chats: Iterable[int] = await self.storage.get_chats()
+        except Exception:
+            log.exception("get_chats() failed (RSI)")
+            return
+
+        chats = list(set(chats))
+        if not chats:
+            log.info("RSI scan: no subscribed chats, skip")
+            return
+
+        for symbol in pairs:
+            results = await asyncio.gather(*(self._last_rsi(symbol, tf) for tf in self.RSI_TIMEFRAMES))
+            rsi_values: dict[str, float] = {}
+            close_ts_by_tf: dict[str, int] = {}
+            for tf, (val, close_ts) in zip(self.RSI_TIMEFRAMES, results):
+                if val is not None:
+                    rsi_values[tf] = val
+                if close_ts is not None:
+                    close_ts_by_tf[tf] = close_ts
+
+            if len(rsi_values) < 2:
+                continue
+
+            await self._maybe_send_rsi_alerts(application, symbol, rsi_values, close_ts_by_tf, chats)
+
+    async def _maybe_send_rsi_alerts(
+        self,
+        application,
+        symbol: str,
+        rsi_values: dict[str, float],
+        close_ts_by_tf: dict[str, int],
+        chats: List[int],
+    ) -> None:
+        checks = (
+            ("overbought", lambda v: v >= 75, ">= 75"),
+            ("oversold", lambda v: v <= 25, "<= 25"),
+        )
+
+        for direction, predicate, condition_text in checks:
+            tfs_hit = [tf for tf, val in rsi_values.items() if predicate(val)]
+            if len(tfs_hit) < 2:
+                continue
+
+            ts_candidates = [close_ts_by_tf.get(tf) for tf in tfs_hit if close_ts_by_tf.get(tf) is not None]
+            if not ts_candidates:
+                continue
+            close_ts = max(ts_candidates)
+
+            sorted_tfs_key = ",".join(sorted(tfs_hit))
+            dedup_key = f"{symbol}:rsi-multi:{direction}:{sorted_tfs_key}:close{close_ts}"
+            log.info(
+                "RSI ALERT detected: %s direction=%s tfs=%s close_ts=%s values=%s",
+                symbol,
+                direction,
+                tfs_hit,
+                close_ts,
+                {tf: round(val, 2) for tf, val in rsi_values.items()},
+            )
+            log.info("Dedup key -> %s", dedup_key)
+
+            strong = len(tfs_hit) == len(self.RSI_TIMEFRAMES)
+            prefix = "⭐️ " if strong else ""
+            count_str = f"{len(tfs_hit)}/{len(self.RSI_TIMEFRAMES)}"
+            zone_label = f"{'сильный ' if strong else ''}{direction}"
+            rsi_line = ", ".join(
+                f"{tf} = {rsi_values[tf]:.1f}" if tf in rsi_values else f"{tf} = n/a"
+                for tf in self.RSI_TIMEFRAMES
+            )
+            text = (
+                f"{prefix}⚠️ <b>{symbol}</b> • многотаймфреймовый RSI\n"
+                f"RSI(14): {rsi_line}\n"
+                f"Зона: {zone_label} ({condition_text}) на {count_str} таймфреймах"
+            )
+
+            await self._broadcast_rsi_alert(application, chats, dedup_key, text)
+
+    async def _broadcast_rsi_alert(self, application, chats: List[int], dedup_key: str, text: str) -> None:
+        sent_any = False
+        for chat_id in chats:
+            try:
+                try:
+                    if await self.storage.is_alert_sent(chat_id, dedup_key):
+                        log.info("Skip RSI alert for chat=%s (already sent): %s", chat_id, dedup_key)
+                        continue
+                except Exception:
+                    log.exception("storage.is_alert_sent(chat) failed (RSI)")
+
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                    disable_web_page_preview=True,
+                )
+                log.debug("Sent RSI alert to chat=%s", chat_id)
+                sent_any = True
+
+                try:
+                    await self.storage.mark_alert_sent(chat_id, dedup_key)
+                except Exception:
+                    log.exception("storage.mark_alert_sent(chat) failed (RSI)")
+
+            except Forbidden:
+                log.warning("Forbidden chat=%s (blocked or never /start). Removing.", chat_id)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except BadRequest as e:
+                log.warning("BadRequest chat=%s: %s. Removing.", chat_id, e)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except Exception as e:
+                log.exception("Send failed chat=%s: %s (skip, continue)", chat_id, e)
+
+        if not sent_any:
+            log.warning("RSI alert NOT marked sent (no successful deliveries): %s", dedup_key)
+
+    async def _last_rsi(self, symbol: str, tf: str, period: int = 14) -> tuple[float | None, int | None]:
+        limit = max(self.TF_LIMITS.get(tf, self.klines_limit), period + 5)
+        try:
+            klines = await self.bn.get_klines(symbol, tf, limit=limit)
+        except Exception:
+            log.exception("binance.get_klines(%s, %s) failed (RSI)", symbol, tf)
+            return None, None
+
+        closed = self._closed_only(klines)
+        if len(closed) < period + 1:
+            return None, None
+
+        try:
+            df = self.klines_to_df(closed)
+        except Exception:
+            log.exception("to_df failed for %s %s (RSI)", symbol, tf)
+            return None, None
+
+        if df.empty or len(df) < period + 1:
+            return None, None
+
+        rsi_series = rsi_ewma(df["close"], period=period).dropna()
+        if rsi_series.empty:
+            return None, None
+
+        rsi_value = float(rsi_series.iloc[-1])
+        try:
+            close_ts = int(df.iloc[-1]["close_time"].timestamp())
+        except Exception:
+            close_ts = int(pd.to_datetime(df.iloc[-1]["close_time"]).timestamp())
+
+        return rsi_value, close_ts
 
     # ---------- ВСПОМОГАТЕЛЬНОЕ ----------
 
