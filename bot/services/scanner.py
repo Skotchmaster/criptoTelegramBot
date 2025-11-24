@@ -9,6 +9,7 @@ import pandas as pd
 from telegram.error import Forbidden, BadRequest  # PTB exceptions
 
 from bot.utils.indicators import rsi_ewma
+from bot.services.patterns.dragon import DragonDetector, DragonPattern, DragonPoint
 
 log = logging.getLogger("bot.scanner")
 
@@ -26,6 +27,7 @@ class Scanner:
 
     TF_LIMITS = {"1h": 200, "4h": 240, "1d": 500}
     RSI_TIMEFRAMES = ("1h", "4h", "1d")
+    DRAGON_TIMEFRAMES = ("1h", "4h", "1d")
 
     def __init__(
         self,
@@ -45,6 +47,7 @@ class Scanner:
         self.required_streak = required_streak
         self.timeframes = list(timeframes)
         self.klines_limit = klines_limit
+        self.dragon_detector = DragonDetector()
 
     async def scannable_pairs(self) -> List[str]:
         """Список доступных торговых пар (до 100 шт.). Используется в /analyze."""
@@ -67,6 +70,7 @@ class Scanner:
                 await asyncio.sleep(self.batch_sleep)
 
         await self.scan_rsi_multi_tf_and_alert(application, pairs=pairs)
+        await self.scan_dragon_and_alert(application, pairs=pairs)
 
     async def _process_pair_tf(self, application, symbol: str, tf: str) -> None:
         """Обработка одной пары на одном таймфрейме: тянем klines, проверяем серию и шлём алерт (per-chat дедуп)."""
@@ -235,7 +239,7 @@ class Scanner:
         chats: List[int],
     ) -> None:
         checks = (
-            ("overbought", lambda v: v >= 75, ">= 75"),
+            ("overbought", lambda v: v >= 99, ">= 75"),
             ("oversold", lambda v: v <= 25, "<= 25"),
         )
 
@@ -320,6 +324,137 @@ class Scanner:
 
         if not sent_any:
             log.warning("RSI alert NOT marked sent (no successful deliveries): %s", dedup_key)
+
+    async def scan_dragon_and_alert(self, application, pairs: Sequence[str] | None = None) -> None:
+        pairs = list(pairs) if pairs is not None else await self._resolve_pairs()
+        if not pairs:
+            log.warning("Dragon scan: no pairs to process")
+            return
+
+        try:
+            chats: Iterable[int] = await self.storage.get_chats()
+        except Exception:
+            log.exception("get_chats() failed (Dragon)")
+            return
+
+        chats = list(set(chats))
+        if not chats:
+            log.info("Dragon scan: no subscribed chats, skip")
+            return
+
+        for symbol in pairs:
+            for tf in self.DRAGON_TIMEFRAMES:
+                limit = max(self.TF_LIMITS.get(tf, self.klines_limit), 300)
+                try:
+                    klines = await self.bn.get_klines(symbol, tf, limit=limit)
+                except Exception:
+                    log.exception("binance.get_klines(%s, %s) failed (Dragon)", symbol, tf)
+                    continue
+
+                closed = self._closed_only(klines)
+                if len(closed) < 30:
+                    continue
+
+                try:
+                    df = self.klines_to_df(closed)
+                except Exception:
+                    log.exception("to_df failed for %s %s (Dragon)", symbol, tf)
+                    continue
+
+                if df.empty or len(df) < 30:
+                    continue
+
+                patterns = self.dragon_detector.detect_all(symbol, tf, df)
+                if not patterns:
+                    continue
+
+                for pattern in patterns:
+                    await self._broadcast_dragon_alert(application, pattern, chats)
+
+    async def _broadcast_dragon_alert(
+        self,
+        application,
+        pattern: DragonPattern,
+        chats: List[int],
+    ) -> None:
+        direction_short = "bull" if pattern.direction == "bullish" else "bear"
+        try:
+            tail_ts = int(pattern.confirm_candle_time.timestamp())
+        except Exception:
+            tail_ts = int(pd.to_datetime(pattern.confirm_candle_time).timestamp())
+
+        dedup_key = f"{pattern.symbol}:dragon:{direction_short}:{pattern.timeframe}:tail{tail_ts}"
+        log.info(
+            "DRAGON pattern detected: %s %s direction=%s confirm_ts=%s",
+            pattern.symbol,
+            pattern.timeframe,
+            pattern.direction,
+            pattern.confirm_candle_time,
+        )
+        log.info("Dragon Dedup key -> %s", dedup_key)
+
+        dir_label = "Bullish" if pattern.direction == "bullish" else "Bearish"
+        tail_comment = "Tail: пробой вверх после правой лапы" if pattern.direction == "bullish" else "Tail: пробой вниз после правой лапы"
+
+        def fmt_point(pt: DragonPoint) -> str:
+            try:
+                t = pt.time.strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                t = str(pt.time)
+            return f"{pt.price:.4f} ({t})"
+
+        text = (
+            f"🐉 <b>{pattern.symbol}</b> • {dir_label} Dragon pattern на {pattern.timeframe}\n"
+            f"Head: {fmt_point(pattern.head)}\n"
+            f"Left paw: {fmt_point(pattern.left_paw)}\n"
+            f"Hump: {fmt_point(pattern.hump)}\n"
+            f"Right paw: {fmt_point(pattern.right_paw)}\n"
+            f"{tail_comment}\n"
+            f"Комментарий: {'W' if pattern.direction == 'bullish' else 'M'}-образный разворот"
+        )
+
+        sent_any = False
+        for chat_id in chats:
+            try:
+                try:
+                    if await self.storage.is_alert_sent(chat_id, dedup_key):
+                        log.info("Skip Dragon alert for chat=%s (already sent): %s", chat_id, dedup_key)
+                        continue
+                except Exception:
+                    log.exception("storage.is_alert_sent(chat) failed (Dragon)")
+
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                    disable_web_page_preview=True,
+                )
+                log.debug("Sent Dragon alert to chat=%s", chat_id)
+                sent_any = True
+
+                try:
+                    await self.storage.mark_alert_sent(chat_id, dedup_key)
+                except Exception:
+                    log.exception("storage.mark_alert_sent(chat) failed (Dragon)")
+
+            except Forbidden:
+                log.warning("Forbidden chat=%s (blocked or never /start). Removing.", chat_id)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except BadRequest as e:
+                log.warning("BadRequest chat=%s: %s. Removing.", chat_id, e)
+                try:
+                    await self.storage.remove_chat(chat_id)
+                except Exception:
+                    log.exception("remove_chat failed for %s", chat_id)
+            except Exception as e:
+                log.exception("Send failed chat=%s: %s (skip, continue)", chat_id, e)
+
+        if not sent_any:
+            log.warning("Dragon alert NOT marked sent (no successful deliveries): %s", dedup_key)
 
     async def _last_rsi(self, symbol: str, tf: str, period: int = 14) -> tuple[float | None, int | None]:
         limit = max(self.TF_LIMITS.get(tf, self.klines_limit), period + 5)
